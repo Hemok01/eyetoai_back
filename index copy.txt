@@ -1,0 +1,191 @@
+// Firebase Admin SDK 설정 및 Express 서버를 사용하여 백엔드 기반 푸시 알림을 구현하는 예시입니다.
+import express from 'express';
+import admin from 'firebase-admin';
+import serviceAccount from './serviceAccountKey.json' assert { type: "json" };
+import { databaseURL } from './config.js';
+import supertest from 'supertest';
+import { expect } from 'chai';
+import OpenAI from 'openai';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+// OpenAI 초기화
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// Firebase 초기화
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: databaseURL,
+});
+
+const db = admin.firestore();
+const app = express();
+const PORT = 4000;
+
+app.use(express.json());
+
+// 푸시 알림을 보내는 함수
+const sendPushNotification = (token, title, message) => {
+  const messagePayload = {
+    notification: {
+      title: title,
+      body: message,
+    },
+    token: token,
+  };
+
+  admin.messaging().send(messagePayload)
+    .then(response => {
+      console.log('Successfully sent message:', response);
+    })
+    .catch(error => {
+      console.error('Error sending message:', error);
+    });
+};
+
+// GPT 메시지 생성 함수
+async function generateGPTMessage(prompt) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo-0125', // 파인튜닝된 모델 이름
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    return response.choices[0].message.content.trim();
+  } catch (error) {
+    console.error('GPT 메시지 생성 실패:', error);
+    return '메시지 생성 실패';
+  }
+}
+
+// 이용 시간 확인 및 알림 전송 로직
+const checkUsageAndSendNotifications = async () => {
+  try {
+    const usageDocs = await db.collection('usageData').get();
+    for (const doc of usageDocs.docs) {
+      const usageData = doc.data();
+      const { childId, totalUsage, totalLimit } = usageData;
+      const remainingTime = totalLimit - totalUsage;
+
+      // 알림이 필요한 경우 (5분 또는 10분 남았을 때)
+      if (remainingTime === 10 || remainingTime === 5) {
+        // FCM 토큰 가져오기 (예시: fcmTokens 컬렉션에서 토큰 가져오기)
+        const tokenDocs = await db.collection('fcmTokens').where('userId', '==', childId).get();
+        for (const tokenDoc of tokenDocs.docs) {
+          const fcmToken = tokenDoc.data().token;
+
+          if (fcmToken) {
+            // GPT 메시지 생성
+            const prompt = `상황: 사용 제한 시간이 ${remainingTime}분 남음, 잔여 시간이 얼마 남았는지 알림을 보내주세요. "제한 시간이 5분 남았습니다. 내일 또 다시 만날까요?" 이런 느낌으로 작성해주세요`;
+            const message = await generateGPTMessage(prompt);
+
+            const title = '사용 시간 경고';
+            sendPushNotification(fcmToken, title, message);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('사용 시간 확인 중 오류 발생:', error);
+  }
+};
+
+// 주기적으로 알림을 확인하는 스케줄러 설정 (예: 1분마다)
+setInterval(checkUsageAndSendNotifications, 60000); // 60,000ms = 1분
+
+// FCM 토큰 CRUD API
+// FCM 토큰 생성 (등록)
+app.post('/api/fcmTokens', async (req, res) => {
+  try {
+    const { userId, token, deviceInfo } = req.body;
+    const newTokenRef = await db.collection('fcmTokens').add({
+      userId,
+      token,
+      deviceInfo,
+    });
+    res.status(201).json({ message: 'FCM 토큰이 등록되었습니다.', id: newTokenRef.id });
+  } catch (error) {
+    console.error('FCM 토큰 등록 중 오류 발생:', error);
+    res.status(500).json({ error: 'FCM 토큰 등록 중 오류가 발생했습니다.' });
+  }
+});
+
+// FCM 토큰 조회
+app.get('/api/fcmTokens/:id', async (req, res) => {
+  try {
+    const tokenId = req.params.id;
+    const tokenDoc = await db.collection('fcmTokens').doc(tokenId).get();
+    if (tokenDoc.exists) {
+      res.status(200).json(tokenDoc.data());
+    } else {
+      res.status(404).json({ error: 'FCM 토큰을 찾을 수 없습니다.' });
+    }
+  } catch (error) {
+    console.error('FCM 토큰 조회 중 오류 발생:', error);
+    res.status(500).json({ error: 'FCM 토큰 조회 중 오류가 발생했습니다.' });
+  }
+});
+
+// FCM 토큰 업데이트
+app.put('/api/fcmTokens/:id', async (req, res) => {
+  try {
+    const tokenId = req.params.id;
+    const updatedData = req.body;
+    await db.collection('fcmTokens').doc(tokenId).update(updatedData);
+    res.status(200).json({ message: 'FCM 토큰이 업데이트되었습니다.' });
+  } catch (error) {
+    console.error('FCM 토큰 업데이트 중 오류 발생:', error);
+    res.status(500).json({ error: 'FCM 토큰 업데이트 중 오류가 발생했습니다.' });
+  }
+});
+
+// FCM 토큰 삭제
+app.delete('/api/fcmTokens/:id', async (req, res) => {
+  try {
+    const tokenId = req.params.id;
+    await db.collection('fcmTokens').doc(tokenId).delete();
+    res.status(200).json({ message: 'FCM 토큰이 삭제되었습니다.' });
+  } catch (error) {
+    console.error('FCM 토큰 삭제 중 오류 발생:', error);
+    res.status(500).json({ error: 'FCM 토큰 삭제 중 오류가 발생했습니다.' });
+  }
+});
+
+// 서버 시작
+app.listen(PORT, () => {
+  console.log(`서버가 http://localhost:${PORT}에서 실행 중입니다.`);
+});
+
+// 자동화 테스트 설정
+if (process.env.NODE_ENV === 'test') {
+  describe('Push Notification API', () => {
+    it('should check usage data and send notifications if needed', async () => {
+      const usageData = {
+        childId: 'testChild',
+        totalUsage: 50,
+        totalLimit: 60,
+        appUsage: [],
+        timeSlotUsage: [],
+        lastUpdated: new Date(),
+      };
+
+      // Firestore에 테스트 데이터 추가
+      await db.collection('usageData').doc('testUsage').set(usageData);
+
+      // 알림 확인 로직 호출
+      await checkUsageAndSendNotifications();
+
+      // 테스트 데이터 삭제
+      await db.collection('usageData').doc('testUsage').delete();
+    });
+  });
+
+  after(async () => {
+    await db.terminate();
+  });
+}
+
+export default app;
